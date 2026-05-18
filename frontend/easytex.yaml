@@ -1,0 +1,6 @@
+port: 8081
+root_dir: .
+max_concurrent_builds: 4
+session_ttl_hours: 24
+build_timeout_mins: 15
+compress_pdf: true

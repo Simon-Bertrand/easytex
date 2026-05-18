@@ -1,0 +1,25 @@
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "types:rust": "bun scripts/generate-types.js",
+    "dev": "vite",
+    "build": "bun run types:rust && tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@codemirror/legacy-modes": "^6.5.3",
+    "codemirror": "^6.0.2",
+    "lucide-solid": "^1.16.0",
+    "pdfjs-dist": "^5.7.284",
+    "solid-js": "^1.9.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.3",
+    "typescript": "~6.0.2",
+    "vite": "^8.0.12",
+    "vite-plugin-solid": "^2.11.12"
+  }
+}

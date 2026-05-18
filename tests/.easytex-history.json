@@ -1,0 +1,72 @@
+[
+  {
+    "project": "demo",
+    "timestamp": "2026-05-18 18:48:59",
+    "duration": 1.5804496,
+    "status": "Success",
+    "label": "Initial Build"
+  },
+  {
+    "project": "demo",
+    "timestamp": "2026-05-18 18:49:01",
+    "duration": 1.4491895,
+    "status": "Success",
+    "label": "Manual Build"
+  },
+  {
+    "project": "demo",
+    "timestamp": "2026-05-18 18:49:03",
+    "duration": 1.4809682,
+    "status": "Success",
+    "label": "Manual Build"
+  },
+  {
+    "project": "test-1779122945062",
+    "timestamp": "2026-05-18 18:49:07",
+    "duration": 1.4673877,
+    "status": "Success",
+    "label": "Auto-Build"
+  },
+  {
+    "project": "test-project-1779123006046",
+    "timestamp": "2026-05-18 18:50:08",
+    "duration": 1.3673406,
+    "status": "Success",
+    "label": "Auto-Build"
+  },
+  {
+    "project": "demo",
+    "timestamp": "2026-05-18 18:50:58",
+    "duration": 1.4332273,
+    "status": "Success",
+    "label": "Initial Build"
+  },
+  {
+    "project": "demo",
+    "timestamp": "2026-05-18 18:51:00",
+    "duration": 1.5911267,
+    "status": "Success",
+    "label": "Manual Build"
+  },
+  {
+    "project": "demo",
+    "timestamp": "2026-05-18 18:51:02",
+    "duration": 1.4418494,
+    "status": "Success",
+    "label": "Manual Build"
+  },
+  {
+    "project": "test-1779123065504",
+    "timestamp": "2026-05-18 18:51:07",
+    "duration": 1.4665519,
+    "status": "Success",
+    "label": "Auto-Build"
+  },
+  {
+    "project": "demo",
+    "timestamp": "2026-05-18 18:51:07",
+    "duration": 1.5128442,
+    "status": "Success",
+    "label": "Manual Build"
+  }
+]

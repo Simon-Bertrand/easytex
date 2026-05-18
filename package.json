@@ -1,0 +1,11 @@
+{
+  "name": "easytex-e2e",
+  "version": "1.0.0",
+  "description": "Ultimate E2E tests for EasyTex",
+  "devDependencies": {
+    "@playwright/test": "^1.44.0"
+  },
+  "scripts": {
+    "test": "playwright test"
+  }
+}
