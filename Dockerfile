@@ -1,3 +1,14 @@
+FROM rust:1-bookworm AS tectonic-builder
+ARG TECTONIC_VERSION=0.16.9
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libfontconfig1-dev \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install tectonic --version "${TECTONIC_VERSION}" --locked
+
 FROM texlive/texlive:latest
 WORKDIR /app
 
@@ -8,8 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     chktex \
     ghostscript \
-    tectonic \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=tectonic-builder /usr/local/cargo/bin/tectonic /usr/local/bin/tectonic
 
 # Copy easytex server binary (compiled locally on host)
 COPY target/release/easytex /usr/local/bin/easytex
