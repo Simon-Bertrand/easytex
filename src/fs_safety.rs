@@ -7,11 +7,14 @@
 
 use std::path::{Path as FsPath, PathBuf};
 
-use tokio::fs;
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
 
 use crate::{
     errors::AppError,
-    utils::{is_editable_project_file, safe_project_file},
+    utils::{is_editable_project_file, rand_hex_string, safe_project_file},
 };
 
 /// Represents a validated project file with verified safe absolute and relative paths.
@@ -61,30 +64,51 @@ pub fn resolve_project_file(
 /// * Returns `AppError::PayloadTooLarge` if file size exceeds `max_bytes`.
 /// * Returns `AppError::NotFound` if the target file does not exist on disk.
 pub async fn read_text_limited(path: &FsPath, max_bytes: usize) -> Result<String, AppError> {
-    match fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(AppError::Forbidden("Symlinks are not readable".into()));
-        }
-        Ok(metadata) if metadata.len() as usize > max_bytes => {
-            return Err(AppError::PayloadTooLarge(format!(
-                "File too large ({} bytes, max {} bytes)",
-                metadata.len(),
-                max_bytes
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AppError::NotFound("File not found".into()));
-        }
-        Err(error) => return Err(error.into()),
+    if fs::symlink_metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(AppError::Forbidden("Symlinks are not readable".into()));
     }
 
-    fs::read_to_string(path)
-        .await
-        .map_err(|error| match error.kind() {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let file = options.open(path).await.map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return AppError::Forbidden("Symlinks are not readable".into());
+        }
+        match error.kind() {
             std::io::ErrorKind::NotFound => AppError::NotFound("File not found".into()),
             _ => error.into(),
-        })
+        }
+    })?;
+
+    let metadata = file.metadata().await?;
+    if metadata.len() as usize > max_bytes {
+        return Err(AppError::PayloadTooLarge(format!(
+            "File too large ({} bytes, max {} bytes)",
+            metadata.len(),
+            max_bytes
+        )));
+    }
+
+    let mut content = String::new();
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_string(&mut content)
+        .await?;
+    if content.len() > max_bytes {
+        return Err(AppError::PayloadTooLarge(format!(
+            "File too large (max {} bytes)",
+            max_bytes
+        )));
+    }
+    Ok(content)
 }
 
 /// Writes textual content to a sandboxed file securely.
@@ -114,10 +138,32 @@ pub async fn write_text_limited(
         return Err(AppError::Forbidden("Symlinks are not writable".into()));
     }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
+    let Some(parent) = path.parent() else {
+        return Err(AppError::BadRequest("Invalid file path".into()));
+    };
+    fs::create_dir_all(parent).await?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::BadRequest("Invalid file path".into()))?;
+    let tmp_path = parent.join(format!(".{}.{}.tmp", file_name, rand_hex_string(12)));
+
+    let write_result = async {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut tmp = options.open(&tmp_path).await?;
+        tmp.write_all(content.as_bytes()).await?;
+        tmp.sync_data().await?;
+        fs::rename(&tmp_path, path).await?;
+        Ok::<(), std::io::Error>(())
     }
-    fs::write(path, content).await?;
+    .await;
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -160,7 +206,10 @@ pub async fn list_project_files(
                         return false;
                     }
                 } else if let Ok(rel) = path.strip_prefix(&base) {
-                    list.push(rel.to_string_lossy().to_string());
+                    let relative = rel.to_string_lossy().to_string();
+                    if is_editable_project_file(&relative) {
+                        list.push(relative);
+                    }
                 }
             }
         }
@@ -230,6 +279,23 @@ mod tests {
 
         let err = read_text_limited(&link, 1024).await.unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
+
+        let _ = fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn list_project_files_only_returns_editable_files() {
+        let root = temp_project("list-editable");
+        fs::create_dir_all(root.join("build")).await.unwrap();
+        fs::write(root.join("main.tex"), "").await.unwrap();
+        fs::write(root.join("secret.bin"), "").await.unwrap();
+        fs::write(root.join("build").join("generated.tex"), "")
+            .await
+            .unwrap();
+
+        let listed = list_project_files(root.clone(), 10).await.unwrap();
+        assert_eq!(listed.files, vec!["main.tex"]);
+        assert!(listed.complete);
 
         let _ = fs::remove_dir_all(&root).await;
     }

@@ -1,6 +1,8 @@
 # EasyTex
 
-EasyTex is a single-binary and asynchronous Rust application for compiling and previewing local LaTeX projects through a browser UI or your IDE. It watches project files, compiles LaTeX automatically, serves the latest successful PDF preview, and exposes a small web interface for source editing, build logs, SyncTeX navigation, and build downloads. I made this tool because I had enough of my tmux setup with [watchexec](https://github.com/watchexec/watchexec) to write my own Ph.D thesis in local.
+EasyTex is a single-binary and asynchronous Rust application for compiling and previewing local LaTeX projects through a browser UI or your IDE. It watches project files, compiles LaTeX automatically, serves the latest successful PDF preview, and exposes a small web interface for source editing, build logs, SyncTeX navigation, and build downloads. It is designed for local, low-friction writing workflows that need fast preview feedback without a separate watcher setup.
+
+![EasyTex project editor and PDF preview](docs/readme-screenshot.png)
 
 The frontend assets are embedded into the Rust binary at build time, so deploying EasyTex only requires the `easytex` executable plus the external LaTeX/runtime tools used for the LaTeX compilation.
 
@@ -65,6 +67,15 @@ Optional runtime tools:
 - `texloganalyser`: improves warning analysis for `latexmk` builds.
 - `gs` / Ghostscript: enables optional PDF compression.
 
+## Build Prerequisites
+
+To build EasyTex from source, install:
+
+- Rust and Cargo.
+- Bun, for building the browser UI.
+
+Runtime tools such as `tectonic`, `latexmk`, and `texfot` are not needed to compile the binary, but they are required when running the server. Playwright is only required for the E2E test suite.
+
 Use the diagnostic command to check the local environment:
 
 ```bash
@@ -73,19 +84,25 @@ easytex diag projects
 
 The diagnostic checks configuration parsing, runtime tools, root directory readability/writability, history path availability, and whether the configured host/port can be bound.
 
-## Building
-
-Build the frontend assets first:
+Print version metadata for automation:
 
 ```bash
-cd frontend
-bun install
-bun run build
+easytex version --json
 ```
 
-Then build the Rust binary:
+## Building
+
+Build the browser UI and release binary:
 
 ```bash
+make build
+```
+
+Or run the steps manually:
+
+```bash
+cd frontend && bun install && bun run build
+cd ..
 cargo build --release
 ```
 
@@ -123,7 +140,7 @@ Use a custom port:
 Bind outside localhost only when needed:
 
 ```bash
-./target/release/easytex serve projects --host 0.0.0.0
+EASYTEX_ADMIN_TOKEN=<token> ./target/release/easytex serve projects --host 0.0.0.0
 ```
 
 Open the UI at:
@@ -162,6 +179,7 @@ session_ttl_hours: 24
 build_timeout_mins: 15
 compress_pdf: true
 admin_token: null
+require_auth: false
 allow_shell_escape: false
 cors_allowed_origins: []
 history_file: ".easytex-history.json"
@@ -177,13 +195,16 @@ Environment overrides:
 - `PORT`: overrides `port`.
 - `ROOT_DIR`: overrides `root_dir`.
 - `EASYTEX_HOST`: overrides `host`.
-- `EASYTEX_ADMIN_TOKEN`: protects `/admin` and `/api/admin/*`.
+- `EASYTEX_ADMIN_TOKEN`: protects `/admin`, `/api/admin/*`, `/api/*`, `/pdf/*`, and `/events/*` when set.
+- `EASYTEX_REQUIRE_AUTH`: requires `EASYTEX_ADMIN_TOKEN` even when serving only localhost.
 - `EASYTEX_CORS_ALLOWED_ORIGINS`: comma-separated CORS allow-list.
 - `EASYTEX_MAX_EDIT_FILE_SIZE_BYTES`: maximum size accepted by the file-edit API.
 - `EASYTEX_MAX_READ_FILE_SIZE_BYTES`: maximum size returned by the file-read API.
 - `EASYTEX_MAX_PROJECT_FILES`: maximum number of files returned by project listing.
 - `EASYTEX_MAX_PDF_SIZE_BYTES`: maximum PDF size served by `/pdf`.
 - `EASYTEX_READ_ONLY`: set to `true` or `1` to disable mutating routes and editing controls.
+
+When the frontend is served by EasyTex itself, browser API calls should use same-origin relative URLs such as `/api/projects`, `/pdf/<project>`, and `/events/<project>`. CORS is only needed when a separately served frontend, such as the Vite dev server, calls the backend from another origin.
 
 ## HTTP Surface
 
@@ -215,7 +236,12 @@ Primary endpoints:
 - `GET /pdf/:name?dl=1&run=<run_id>`: download a specific successful build.
 - `GET /events/:name`: Server-Sent Events stream for logs/status/reload events.
 - `GET /admin`: basic admin dashboard.
+- `GET /api/admin/metrics`: authenticated operational counters.
 - `POST /api/admin/kill/:name`: stop and remove an active session.
+
+When `admin_token` is configured or `require_auth` is enabled, all `/api/*`, `/api/admin/*`, `/pdf/*`, and `/events/*` endpoints require `Authorization: Bearer <token>`. The static browser UI remains public so it can prompt for the token.
+
+Mutating `POST` API requests also require the CSRF header `X-EasyTex-Request: true`. The bundled browser UI sends this automatically.
 
 ## Build History And Artifacts
 
@@ -243,30 +269,66 @@ RUST_LOG=info easytex serve projects
 RUST_LOG=trace easytex serve projects
 ```
 
-`trace` includes request headers and lower-level watcher details. Build logs shown in the UI are streamed separately over SSE.
+`trace` includes request headers with sensitive values redacted, plus lower-level watcher details. Build logs shown in the UI are streamed separately over SSE.
+
+## Testing
+
+Run the full production gate, including frontend build, Rust checks, unit tests, and Playwright E2E:
+
+```bash
+make tests
+```
+
+Run the auth-protected E2E slice locally:
+
+```bash
+EASYTEX_E2E_ADMIN_TOKEN=<token> bunx playwright test tests/admin-auth.spec.ts
+```
+
+Regenerate the README screenshot:
+
+```bash
+bun run screenshot:readme
+```
 
 ## Security Notes
 
 EasyTex is designed primarily for local or trusted-network use.
 
 - The default bind address is `127.0.0.1`.
-- Set `EASYTEX_ADMIN_TOKEN` before exposing the admin endpoints.
+- Set `EASYTEX_ADMIN_TOKEN` before exposing EasyTex over a network. Binding outside localhost requires an admin token; API, PDF, and SSE requests must include `Authorization: Bearer <token>` when a token is configured.
+- Set `EASYTEX_REQUIRE_AUTH=true` to enforce bearer auth even on localhost.
+- Wildcard CORS (`cors_allowed_origins: ["*"]`) requires an admin token.
+- In the browser UI, enter the token when prompted or store it in `localStorage` under `easytex_admin_token` when using a protected network deployment. PDF rendering, downloads, and SSE logs use the stored bearer token.
 - Keep `allow_shell_escape: false` unless all documents are trusted.
 - File and project paths are validated to reduce traversal risk.
 - Build processes run in process groups so cancellation can terminate subprocesses.
 - Build timeouts are configurable.
 - Use a reverse proxy with TLS if exposing EasyTex over a network.
+- See `SECURITY.md` for vulnerability reporting and deployment guidance.
+
+For a stricter starting point, copy `easytex.prod.yaml` and set `admin_token` through the `EASYTEX_ADMIN_TOKEN` environment variable.
 
 ## Docker
 
-The included Docker setup expects a locally built release binary and mounts `./example` as the served project root.
+Build the EasyTex executable inside Docker using the same sequence as the GitHub release workflow: install frontend dependencies, build the browser UI, then run `cargo build --release`.
 
 ```bash
-cargo build --release
-docker compose up --build
+docker build -f Dockerfile.build --target artifact -t easytex-builder .
+docker create --name easytex-bin easytex-builder
+mkdir -p dist
+docker cp easytex-bin:/out/easytex dist/easytex
+docker rm easytex-bin
 ```
 
-The container sets `EASYTEX_HOST=0.0.0.0` so the service is reachable through the published Docker port.
+The runtime Docker setup expects a release binary at `target/release/easytex` and mounts `./example` as the served project root.
+
+```bash
+make build
+EASYTEX_ADMIN_TOKEN=<token> docker compose up --build
+```
+
+The container sets `EASYTEX_HOST=0.0.0.0` so the service is reachable through the published Docker port. EasyTex requires `EASYTEX_ADMIN_TOKEN` for this network binding.
 
 ## License
 

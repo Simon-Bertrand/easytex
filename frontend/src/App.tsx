@@ -1,6 +1,5 @@
 import { createSignal, createEffect, onMount, For, Show, onCleanup } from 'solid-js';
-import * as pdfjs from 'pdfjs-dist';
-import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
+import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { 
   Play, 
   Square, 
@@ -28,8 +27,19 @@ import {
   type ServerEvent,
 } from './client';
 
-// Configure PDF.js worker
-pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
+let pdfjsModule: typeof import('pdfjs-dist') | null = null;
+
+const loadPdfjs = async () => {
+  if (!pdfjsModule) {
+    const [pdfjs, worker] = await Promise.all([
+      import('pdfjs-dist'),
+      import('pdfjs-dist/build/pdf.worker.mjs?url'),
+    ]);
+    pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
+    pdfjsModule = pdfjs;
+  }
+  return pdfjsModule;
+};
 
 interface LogEntry {
   msg: string;
@@ -154,6 +164,8 @@ function App() {
   const [configRaw, setConfigRaw] = createSignal<string>('');
   const [isSavingConfig, setIsSavingConfig] = createSignal(false);
   const [configError, setConfigError] = createSignal<string | null>(null);
+  const [showAuthModal, setShowAuthModal] = createSignal(false);
+  const [authTokenInput, setAuthTokenInput] = createSignal(window.localStorage.getItem('easytex_admin_token') || '');
 
   const errorLogs = () => logs().filter(l => l.lvl === 'err');
   const warningLogs = () => logs().filter(l => l.lvl === 'warn');
@@ -165,23 +177,23 @@ function App() {
     const info = previewInfo();
     if (!info?.built_at_ms) return null;
     const seconds = Math.max(0, Math.floor((nowMs() - info.built_at_ms) / 1000));
-    if (seconds < 60) return `Built il y a ${seconds}s`;
+    if (seconds < 60) return `Built ${seconds}s ago`;
     const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `Built il y a ${minutes} min`;
+    if (minutes < 60) return `Built ${minutes} min ago`;
     const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `Built il y a ${hours} h`;
+    if (hours < 24) return `Built ${hours}h ago`;
     const days = Math.floor(hours / 24);
-    return `Built il y a ${days} j`;
+    return `Built ${days}d ago`;
   };
   const formatBuildAge = (builtAtMs: number) => {
-    if (!builtAtMs) return 'Date inconnue';
+    if (!builtAtMs) return 'Unknown date';
     const seconds = Math.max(0, Math.floor((nowMs() - builtAtMs) / 1000));
-    if (seconds < 60) return `il y a ${seconds}s`;
+    if (seconds < 60) return `${seconds}s ago`;
     const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `il y a ${minutes} min`;
+    if (minutes < 60) return `${minutes} min ago`;
     const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `il y a ${hours} h`;
-    return `il y a ${Math.floor(hours / 24)} j`;
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
   };
   const formatBytes = (bytes: number) => {
     if (bytes > 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
@@ -313,7 +325,7 @@ function App() {
   };
   let viewerContainer: HTMLDivElement | undefined;
   let editorContainer: HTMLDivElement | undefined;
-  let pdfDoc: pdfjs.PDFDocumentProxy | null = null;
+  let pdfDoc: PDFDocumentProxy | null = null;
   let intersectionObserver: IntersectionObserver | null = null;
   let editorView: EditorView | null = null;
   let saveTimeout: any = null;
@@ -334,6 +346,10 @@ function App() {
     };
     window.addEventListener('keydown', handleKey);
     onCleanup(() => window.removeEventListener('keydown', handleKey));
+
+    const handleAuthRequired = () => setShowAuthModal(true);
+    window.addEventListener('easytex-auth-required', handleAuthRequired);
+    onCleanup(() => window.removeEventListener('easytex-auth-required', handleAuthRequired));
 
     const clock = window.setInterval(() => setNowMs(Date.now()), 1000);
     onCleanup(() => window.clearInterval(clock));
@@ -616,7 +632,7 @@ function App() {
   };
 
   const createFile = async () => {
-    const path = prompt("Entrez le chemin du nouveau fichier (ex: chapters/conclusion.tex) :");
+    const path = prompt("Enter the new file path (for example: chapters/conclusion.tex):");
     if (!path || !path.trim()) return;
     const trimmed = path.trim();
     
@@ -626,7 +642,7 @@ function App() {
       setActiveFile(trimmed);
     } catch (e) {
       console.error("Failed to create file", e);
-      alert("Impossible de créer le fichier.");
+      alert("Failed to create the file.");
     }
   };
 
@@ -739,12 +755,12 @@ function App() {
     const closeEvents = easytexClient.connectEvents(p, {
       onOpen: () => {
         setIsConnected(true);
-        setLogs([{ msg: '🟢 Connecté au serveur', lvl: 'ok', id: Date.now() }]);
+        setLogs([{ msg: 'Connected to server', lvl: 'ok', id: Date.now() }]);
         loadPdf();
       },
       onError: () => {
         setIsConnected(false);
-        setLogs(prev => [...prev, { msg: '🔴 Connexion perdue, reconnexion...', lvl: 'err', id: Date.now() }]);
+        setLogs(prev => [...prev, { msg: 'Connection lost, reconnecting...', lvl: 'err', id: Date.now() }]);
         closeEvents();
         setTimeout(() => window.location.reload(), 2000);
       },
@@ -760,12 +776,12 @@ function App() {
             return next.slice(-200);
           });
         } else if (m.type === 'pdf') {
-          setLogs(prev => [...prev, { msg: '🔄 Rechargement du PDF...', lvl: 'info', id: Date.now() }]);
+          setLogs(prev => [...prev, { msg: 'Reloading PDF...', lvl: 'info', id: Date.now() }]);
           loadPdf();
         } else if (m.type === 'stats') {
           setStats(m.data);
         } else if (m.type === 'status') {
-          const building = m.data !== 'Idle' && m.data !== 'Error';
+          const building = m.data !== 'Idle' && m.data !== 'Error' && m.data !== 'TimedOut';
           if (building) setDiagnostics([]);
           setIsBuilding(building);
           document.title = building ? `🔨 ${projectName()}...` : `EasyTex — ${projectName()}`;
@@ -788,7 +804,8 @@ function App() {
 
     try {
       await loadPreviewInfo(p);
-      const loadingTask = pdfjs.getDocument(easytexClient.pdfUrl(p));
+      const pdfjs = await loadPdfjs();
+      const loadingTask = pdfjs.getDocument(easytexClient.pdfDocumentRequest(p));
       pdfDoc = await loadingTask.promise;
       setTotalPage(pdfDoc.numPages);
       renderAllPages();
@@ -817,12 +834,16 @@ function App() {
   };
 
   const downloadBuild = (run: string) => {
-    window.open(easytexClient.pdfDownloadUrl(projectName(), run));
+    easytexClient.downloadPdf(projectName(), run).catch((error) => {
+      console.error('PDF download failed', error);
+    });
   };
 
   const downloadLatestPdf = () => {
     setShowExportMenu(false);
-    window.open(easytexClient.pdfDownloadUrl(projectName()));
+    easytexClient.downloadPdf(projectName()).catch((error) => {
+      console.error('PDF download failed', error);
+    });
   };
 
   const openDownloadsFromExport = async () => {
@@ -992,6 +1013,22 @@ function App() {
     }
   };
 
+  const saveAuthToken = () => {
+    const token = authTokenInput().trim();
+    if (token) {
+      window.localStorage.setItem('easytex_admin_token', token);
+    } else {
+      window.localStorage.removeItem('easytex_admin_token');
+    }
+    setShowAuthModal(false);
+    fetchCapabilities();
+    if (projectName()) {
+      fetchProjectFiles(projectName());
+    } else {
+      fetchProjects();
+    }
+  };
+
 
 
   const updateZoom = (delta: number) => {
@@ -1066,7 +1103,7 @@ function App() {
                 <div style="display:flex;align-items:center;gap:12px">
                   <div style="display:flex;align-items:center;gap:8px">
                     <span style="font-size:14px">💻</span>
-                    <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--txt)">Zone de Travail</span>
+                    <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--txt)">Working Zone</span>
                   </div>
                   
                   {/* Build stats */}
@@ -1169,10 +1206,10 @@ function App() {
                     <Show when={showExportMenu()}>
                       <div style="position:absolute; right:0; top:32px; min-width:180px; background:var(--panel); border:1px solid var(--brd); border-radius:8px; box-shadow:0 14px 36px rgba(0,0,0,0.45); padding:6px; z-index:500; display:flex; flex-direction:column; gap:4px;">
                         <button class="btn" onClick={downloadLatestPdf} style="justify-content:flex-start; height:30px; padding:6px 8px; font-size:12px; border:none; background:transparent;">
-                          Télécharger
+                          Download
                         </button>
                         <button class="btn" onClick={openDownloadsFromExport} style="justify-content:flex-start; height:30px; padding:6px 8px; font-size:12px; border:none; background:transparent;">
-                          Voir l'histoire de build
+                          View build history
                         </button>
                       </div>
                     </Show>
@@ -1185,7 +1222,7 @@ function App() {
                     onClick={() => setShowEditor(!showEditor())} 
                     style="padding: 4px 10px; font-size: 11px; height: 26px; display: flex; align-items: center; gap: 6px; cursor: pointer; background: rgba(255,255,255,0.02); border: 1px solid var(--brd); border-radius: 4px;"
                   >
-                    <span>{showEditor() ? "👁️ Masquer l'éditeur" : "👁️‍🗨️ Afficher l'éditeur"}</span>
+                    <span>{showEditor() ? "Hide editor" : "Show editor"}</span>
                   </button>
                 </div>
               </div>
@@ -1199,9 +1236,9 @@ function App() {
                   style={{ width: `${sidebarWidth()}px` }}
                 >
                   <div class="sidebar-header">
-                    <span class="sidebar-title">Fichiers</span>
+                    <span class="sidebar-title">Files</span>
                     <Show when={!isReadOnly()}>
-                      <button class="sidebar-btn" onClick={createFile} title="Nouveau fichier">
+                      <button class="sidebar-btn" onClick={createFile} title="New file">
                         <Plus size={14} />
                       </button>
                     </Show>
@@ -1255,7 +1292,7 @@ function App() {
                     <div style="width:40px;height:40px;border-radius:50%;background:var(--blue);opacity:0.6;animation:pulse 2s infinite"></div>
                     <span style="font-size:14px;letter-spacing:0.02em">Generating initial PDF preview...</span>
                     <Show when={!isReadOnly()}>
-                      <button class="btn btn-blue" style="margin-top:8px" onClick={runAction}>Lancer le build</button>
+                      <button class="btn btn-blue" style="margin-top:8px" onClick={runAction}>Run build</button>
                     </Show>
                  </div>
               </Show>
@@ -1305,7 +1342,7 @@ function App() {
                     <button 
                       class="delete-btn" 
                       onClick={(e) => deleteProject(p, e)} 
-                      title="Supprimer le projet"
+                      title="Delete project"
                     >
                       🗑️
                     </button>
@@ -1323,23 +1360,54 @@ function App() {
         </Show>
       </main>
 
+      <Show when={showAuthModal()}>
+        <div id="modal-overlay" onClick={() => setShowAuthModal(false)}>
+          <div class="modal-box" onClick={(e) => e.stopPropagation()} style="max-height: 75vh; display: flex; flex-direction: column; width: 480px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--brd); padding-bottom:16px;">
+              <h3 style="font-size:16px; font-weight:700; color:var(--txt)">Authentication Required</h3>
+              <button class="sidebar-btn" onClick={() => setShowAuthModal(false)} style="font-size: 20px;">×</button>
+            </div>
+            <div style="margin:20px 0; display:flex; flex-direction:column; gap:12px;">
+              <label style="font-size:12px; color:var(--sub);">EasyTex admin token</label>
+              <input
+                type="password"
+                value={authTokenInput()}
+                onInput={(e) => setAuthTokenInput(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') saveAuthToken();
+                }}
+                style="height:36px; background:#0b0d11; border:1px solid var(--brd); border-radius:8px; padding:0 12px; color:var(--txt); outline:none;"
+                autofocus
+              />
+              <p style="font-size:12px; color:var(--sub); line-height:1.5; margin:0;">
+                The token is stored locally in this browser and sent as a bearer token to protected routes.
+              </p>
+            </div>
+            <div style="display:flex; justify-content:flex-end; gap:8px; border-top:1px solid var(--brd); padding-top:16px;">
+              <button class="btn" onClick={() => setShowAuthModal(false)}>Cancel</button>
+              <button class="btn btn-blue" onClick={saveAuthToken}>Save Token</button>
+            </div>
+          </div>
+        </div>
+      </Show>
+
       <Show when={showErrorModal()}>
         <div id="modal-overlay" onClick={() => setShowErrorModal(false)}>
           <div class="modal-box" onClick={(e) => e.stopPropagation()} style="max-height: 80vh; display: flex; flex-direction: column; width: 680px;">
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--brd); padding-bottom:16px;">
-              <h3 style="font-size:16px; font-weight:700; color:var(--txt)">Rapport d'Erreurs de Compilation</h3>
+              <h3 style="font-size:16px; font-weight:700; color:var(--txt)">Compilation Report</h3>
               <button class="sidebar-btn" onClick={() => setShowErrorModal(false)} style="font-size: 20px;">×</button>
             </div>
             <div style="flex:1; overflow-y:auto; margin: 20px 0; padding-right: 8px; display:flex; flex-direction:column; gap:12px;">
               <Show when={errorCount() === 0 && warningDiagnostics().length === 0 && warningLogs().length === 0}>
                 <div style="text-align:center; padding:40px; color:var(--sub)">
                   <span style="font-size:32px">🎉</span>
-                  <p style="margin-top:12px; font-weight:500">Aucune erreur ou avertissement détecté !</p>
+                  <p style="margin-top:12px; font-weight:500">No errors or warnings detected.</p>
                 </div>
               </Show>
               
               <Show when={errorDiagnostics().length > 0}>
-                <h4 style="color:var(--red); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; margin-bottom: 4px;">Erreurs ({errorDiagnostics().length})</h4>
+                <h4 style="color:var(--red); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; margin-bottom: 4px;">Errors ({errorDiagnostics().length})</h4>
                 <div style="display:flex; flex-direction:column; gap:8px;">
                   <For each={errorDiagnostics()}>
                     {(diagnostic) => (
@@ -1357,7 +1425,7 @@ function App() {
               </Show>
 
               <Show when={errorDiagnostics().length === 0 && errorLogs().length > 0}>
-                <h4 style="color:var(--red); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; margin-bottom: 4px;">Erreurs ({errorLogs().length})</h4>
+                <h4 style="color:var(--red); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; margin-bottom: 4px;">Errors ({errorLogs().length})</h4>
                 <div style="display:flex; flex-direction:column; gap:8px;">
                   <For each={errorLogs()}>
                     {(log) => (
@@ -1370,7 +1438,7 @@ function App() {
               </Show>
 
               <Show when={warningDiagnostics().length > 0}>
-                <h4 style="color:var(--gold); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; margin-bottom: 4px; margin-top: 12px;">Avertissements ({warningDiagnostics().length})</h4>
+                <h4 style="color:var(--gold); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; margin-bottom: 4px; margin-top: 12px;">Warnings ({warningDiagnostics().length})</h4>
                 <div style="display:flex; flex-direction:column; gap:8px;">
                   <For each={warningDiagnostics()}>
                     {(diagnostic) => (
@@ -1388,7 +1456,7 @@ function App() {
               </Show>
 
               <Show when={warningDiagnostics().length === 0 && warningLogs().length > 0}>
-                <h4 style="color:var(--gold); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; margin-bottom: 4px; margin-top: 12px;">Avertissements ({warningLogs().length})</h4>
+                <h4 style="color:var(--gold); font-size:12px; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; margin-bottom: 4px; margin-top: 12px;">Warnings ({warningLogs().length})</h4>
                 <div style="display:flex; flex-direction:column; gap:8px;">
                   <For each={warningLogs()}>
                     {(log) => (
@@ -1401,7 +1469,7 @@ function App() {
               </Show>
             </div>
             <div style="display:flex; justify-content:flex-end; border-top:1px solid var(--brd); padding-top:16px;">
-              <button class="btn" onClick={() => setShowErrorModal(false)}>Fermer</button>
+              <button class="btn" onClick={() => setShowErrorModal(false)}>Close</button>
             </div>
           </div>
         </div>
@@ -1416,7 +1484,7 @@ function App() {
             </div>
             <div style="flex:1; overflow-y:auto; margin: 20px 0; display:flex; flex-direction:column; gap:12px;">
               <Show when={isLinting()}>
-                <div style="text-align:center; padding:36px; color:var(--sub); font-size:13px;">Analyse en cours...</div>
+                <div style="text-align:center; padding:36px; color:var(--sub); font-size:13px;">Analysis in progress...</div>
               </Show>
               <Show when={!isLinting() && lintResult()}>
                 <div style={{
@@ -1428,13 +1496,13 @@ function App() {
                   "font-weight": "700",
                   "color": lintResult()?.ok ? "var(--green)" : "var(--gold)"
                 }}>
-                  {lintResult()?.ok ? 'Aucun problème signalé' : `ChkTeX terminé avec le code ${lintResult()?.status ?? 'inconnu'}`}
+                  {lintResult()?.ok ? 'No issues reported' : `ChkTeX finished with code ${lintResult()?.status ?? 'unknown'}`}
                 </div>
-                <pre style="background:#0b0d11; border:1px solid var(--brd); border-radius:8px; padding:14px; color:var(--txt); font-family:'JetBrains Mono',monospace; font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; min-height:180px;">{`${lintResult()?.stdout || ''}${lintResult()?.stderr ? `\n${lintResult()?.stderr}` : ''}`.trim() || 'Aucune sortie.'}</pre>
+                <pre style="background:#0b0d11; border:1px solid var(--brd); border-radius:8px; padding:14px; color:var(--txt); font-family:'JetBrains Mono',monospace; font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; min-height:180px;">{`${lintResult()?.stdout || ''}${lintResult()?.stderr ? `\n${lintResult()?.stderr}` : ''}`.trim() || 'No output.'}</pre>
               </Show>
             </div>
             <div style="display:flex; justify-content:flex-end; border-top:1px solid var(--brd); padding-top:16px;">
-              <button class="btn" onClick={() => setShowLintModal(false)}>Fermer</button>
+              <button class="btn" onClick={() => setShowLintModal(false)}>Close</button>
             </div>
           </div>
         </div>
@@ -1444,13 +1512,13 @@ function App() {
         <div id="modal-overlay" onClick={() => setShowDownloadsModal(false)}>
           <div class="modal-box" onClick={(e) => e.stopPropagation()} style="max-height: 75vh; display: flex; flex-direction: column; width: 560px;">
             <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--brd); padding-bottom:16px;">
-              <h3 style="font-size:16px; font-weight:700; color:var(--txt)">Builds réussis</h3>
+              <h3 style="font-size:16px; font-weight:700; color:var(--txt)">Successful Builds</h3>
               <button class="sidebar-btn" onClick={() => setShowDownloadsModal(false)} style="font-size: 20px;">×</button>
             </div>
             <div style="flex:1; overflow-y:auto; margin: 16px 0; display:flex; flex-direction:column; gap:8px;">
               <Show when={successBuilds().length === 0}>
                 <div style="text-align:center; padding:36px; color:var(--sub); font-size:13px;">
-                  Aucun build réussi disponible.
+                  No successful builds available.
                 </div>
               </Show>
               <For each={successBuilds()}>
@@ -1458,7 +1526,7 @@ function App() {
                   <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px; border:1px solid var(--brd); background:rgba(255,255,255,0.02); border-radius:8px;">
                     <div style="min-width:0; display:flex; flex-direction:column; gap:4px;">
                       <div style="display:flex; align-items:center; gap:8px;">
-                        <span style="font-size:12px; font-weight:700; color:var(--txt);">{index() === 0 ? 'Dernier succès' : `Succès #${index() + 1}`}</span>
+                        <span style="font-size:12px; font-weight:700; color:var(--txt);">{index() === 0 ? 'Latest success' : `Success #${index() + 1}`}</span>
                         <span style="font-size:11px; color:var(--sub);">{formatBuildAge(build.built_at_ms)}</span>
                       </div>
                       <div style="font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--sub); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
@@ -1473,7 +1541,7 @@ function App() {
               </For>
             </div>
             <div style="display:flex; justify-content:flex-end; border-top:1px solid var(--brd); padding-top:16px;">
-              <button class="btn" onClick={() => setShowDownloadsModal(false)}>Fermer</button>
+              <button class="btn" onClick={() => setShowDownloadsModal(false)}>Close</button>
             </div>
           </div>
         </div>
@@ -1486,14 +1554,14 @@ function App() {
               <button class="sidebar-btn" onClick={() => setShowConfigModal(false)} style="font-size: 20px;">×</button>
             </div>
             <div style="flex:1; overflow-y:auto; margin: 20px 0; display:flex; flex-direction:column; gap:12px;">
-              <label style="font-size:12px; color:var(--sub);">Modifiez le fichier de configuration de projet <code>EasyTex.toml</code> :</label>
+              <label style="font-size:12px; color:var(--sub);">Edit the project configuration file <code>EasyTex.toml</code>:</label>
               <textarea 
                 id="cfg-txt"
                 value={configRaw()} 
                 onInput={(e) => setConfigRaw(e.currentTarget.value)}
                 style="flex:1; background:#0b0d11; border:1px solid var(--brd); border-radius:8px; padding:14px; color:var(--txt); font-family:'JetBrains Mono',monospace; font-size:12px; line-height:1.55; min-height:300px; resize:vertical; outline:none;"
                 disabled={isReadOnly()}
-                placeholder="# Paramètres du projet EasyTex..."
+                placeholder="# EasyTex project settings..."
               />
               <Show when={configError()}>
                 <div id="cfg-err" style="color:var(--red); font-size:12px; font-weight:500; margin-top:4px;">
@@ -1503,7 +1571,7 @@ function App() {
             </div>
             <div style="display:flex; justify-content:space-between; align-items:center; border-top:1px solid var(--brd); padding-top:16px;">
               <span style="font-size:11px; color:var(--sub);">
-                {isReadOnly() ? "⚠️ Mode lecture seule activé" : ""}
+                {isReadOnly() ? "Read-only mode enabled" : ""}
               </span>
               <div style="display:flex; gap:8px;">
                 <button class="btn" onClick={() => setShowConfigModal(false)}>Cancel</button>

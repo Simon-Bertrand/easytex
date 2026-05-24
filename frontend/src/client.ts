@@ -1,3 +1,4 @@
+import type { AdminMetricsResponse } from './bindings/AdminMetricsResponse';
 import type { BuildArtifactResponse } from './bindings/BuildArtifactResponse';
 import type { ConfigResponse } from './bindings/ConfigResponse';
 import type { FileListResponse } from './bindings/FileListResponse';
@@ -12,6 +13,7 @@ import type { SynctexEditResponse } from './bindings/SynctexEditResponse';
 import type { SynctexViewResponse } from './bindings/SynctexViewResponse';
 
 export type {
+  AdminMetricsResponse,
   BuildArtifactResponse,
   ConfigResponse,
   FileListResponse,
@@ -33,6 +35,10 @@ type EventHandlers = {
 };
 
 type JsonBody = Record<string, unknown>;
+type PdfDocumentRequest = {
+  url: string;
+  httpHeaders?: Record<string, string>;
+};
 
 export class EasyTexClientError extends Error {
   status: number;
@@ -49,6 +55,10 @@ export class EasyTexClientError extends Error {
 export class EasyTexClient {
   async capabilities(): Promise<RuntimeCapabilities> {
     return this.getJson('/api/capabilities');
+  }
+
+  async adminMetrics(): Promise<AdminMetricsResponse> {
+    return this.getJson('/api/admin/metrics');
   }
 
   async projects(): Promise<ProjectsResponse> {
@@ -150,20 +160,71 @@ export class EasyTexClient {
     return `/pdf/${encodeURIComponent(project)}?t=${Date.now()}`;
   }
 
+  pdfDocumentRequest(project: string): PdfDocumentRequest {
+    return {
+      url: this.pdfUrl(project),
+      httpHeaders: this.authHeaderObject(),
+    };
+  }
+
   pdfDownloadUrl(project: string, run?: string): string {
     const query = new URLSearchParams({ dl: '1' });
     if (run) query.set('run', run);
     return `/pdf/${encodeURIComponent(project)}?${query}`;
   }
 
+  async downloadPdf(project: string, run?: string): Promise<void> {
+    const res = await this.request(this.pdfDownloadUrl(project, run), { method: 'GET' });
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${project}${run ? `-${run}` : ''}.pdf`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   connectEvents(project: string, handlers: EventHandlers): () => void {
-    const es = new EventSource(`/events/${encodeURIComponent(project)}`);
-    es.onopen = () => handlers.onOpen?.();
-    es.onerror = () => handlers.onError?.();
-    es.onmessage = ({ data }) => {
-      handlers.onEvent(JSON.parse(data) as ServerEvent);
+    const controller = new AbortController();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const readEvents = async () => {
+      try {
+        const res = await this.request(`/events/${encodeURIComponent(project)}`, {
+          method: 'GET',
+          signal: controller.signal,
+        });
+        handlers.onOpen?.();
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error('SSE stream is unavailable');
+
+        while (!controller.signal.aborted) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+          const frames = buffer.split('\n\n');
+          buffer = frames.pop() || '';
+          for (const frame of frames) {
+            const data = frame
+              .split('\n')
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).trimStart())
+              .join('\n');
+            if (data) handlers.onEvent(JSON.parse(data) as ServerEvent);
+          }
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          handlers.onError?.();
+        }
+      }
     };
-    return () => es.close();
+
+    void readEvents();
+    return () => controller.abort();
   }
 
   private async getJson<T>(url: string): Promise<T> {
@@ -190,11 +251,26 @@ export class EasyTexClient {
   private async request(url: string, init: RequestInit): Promise<Response> {
     const headers = new Headers(init.headers || {});
     headers.set('X-EasyTex-Request', 'true');
+    const token = this.authToken();
+    if (token) headers.set('Authorization', `Bearer ${token}`);
     const res = await fetch(url, { ...init, headers });
     if (!res.ok) {
-      throw new EasyTexClientError(res.status, await res.text());
+      const body = await res.text();
+      if (res.status === 401) {
+        window.dispatchEvent(new CustomEvent('easytex-auth-required', { detail: { url, body } }));
+      }
+      throw new EasyTexClientError(res.status, body);
     }
     return res;
+  }
+
+  private authToken(): string {
+    return window.localStorage.getItem('easytex_admin_token') || '';
+  }
+
+  private authHeaderObject(): Record<string, string> | undefined {
+    const token = this.authToken();
+    return token ? { Authorization: `Bearer ${token}` } : undefined;
   }
 }
 

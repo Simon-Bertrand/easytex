@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 
 test.describe('EasyTex Ultimate E2E Suite', () => {
-  const connected = /Connecté au serveur|Connected to server/;
+  const connected = /Connected to server/;
   
   test('Full Life-Cycle: Dashboard -> Project -> Build -> Stats', async ({ page }) => {
     await page.goto('/');
@@ -20,14 +20,15 @@ test.describe('EasyTex Ultimate E2E Suite', () => {
     await expect(canvas).toBeVisible({ timeout: 45000 });
     
     const runBtn = page.locator('#btn-run');
+    await expect(runBtn).toContainText('Run', { timeout: 45000 });
     await runBtn.click();
     await expect(runBtn).toContainText('Stop');
     await expect(runBtn).toContainText('Run', { timeout: 30000 });
     
     const stats = page.locator('#stats');
-    await expect(stats).toContainText('KB');
-    await expect(stats).toContainText('s');
-    await expect(stats).toContainText('words');
+    await expect
+      .poll(async () => await stats.textContent().catch(() => ''), { timeout: 45000 })
+      .toMatch(/KB[\s\S]*s[\s\S]*words|s[\s\S]*words[\s\S]*KB/);
     
     await page.click('text=Settings');
     const modal = page.locator('#modal');

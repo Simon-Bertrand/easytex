@@ -12,17 +12,38 @@ use tracing::{debug, info, warn};
 
 use crate::config::read_cfg;
 use crate::events;
+use crate::fs_safety;
 use crate::process;
 use crate::state::{
     cancel_session, get_or_create_session, record_build_history, AppState, BuildHistoryEntry,
     BuildPriority, BuildStatus, Session,
 };
-use crate::utils::{is_valid_entrypoint, is_valid_project_name, rand_hex_string};
+use crate::utils::{
+    is_valid_entrypoint, is_valid_project_name, rand_hex_string, safe_project_file,
+};
 
 /// Maximum number of historic run directories kept under `build/runs/` before garbage collection triggers.
 const MAX_RUN_HISTORY_DIRS: usize = 10;
 /// Minimum threshold of successful run directories guaranteed to be kept from deletion.
 const MIN_SUCCESS_RUN_DIRS: usize = 3;
+const MAX_WORD_COUNT_FILE_BYTES: usize = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandOutcome {
+    Success,
+    Failed,
+    TimedOut,
+}
+
+impl CommandOutcome {
+    fn build_status(self) -> BuildStatus {
+        match self {
+            Self::Success => BuildStatus::Success,
+            Self::Failed => BuildStatus::Failed,
+            Self::TimedOut => BuildStatus::TimedOut,
+        }
+    }
+}
 
 /// Recursively counts words across the main document and all sub-files loaded via `\input{}` or `\include{}` directives.
 ///
@@ -36,29 +57,32 @@ pub async fn get_word_count(proj_dir: &FsPath, entrypoint: &str) -> u32 {
     let mut visited = Vec::new();
     let mut stack = vec![proj_dir.join(entrypoint)];
     let mut total = 0;
+    let mut scanned_files = 0usize;
 
     while let Some(path) = stack.pop() {
+        if scanned_files >= 500 {
+            break;
+        }
         if visited.contains(&path) {
             continue;
         }
         visited.push(path.clone());
+        scanned_files += 1;
 
-        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+        if let Ok(content) = fs_safety::read_text_limited(&path, MAX_WORD_COUNT_FILE_BYTES).await {
             total += content.split_whitespace().count() as u32;
 
             let mut search_pos = 0;
-            while let Some(pos) = content[search_pos..]
-                .find("\\input{")
-                .or_else(|| content[search_pos..].find("\\include{"))
-            {
+            while let Some((pos, marker_len)) = find_latex_include(&content[search_pos..]) {
                 let start = search_pos + pos;
                 if let Some(end) = content[start..].find('}') {
-                    let mut sub = content[start + 7..start + end].trim().to_string();
+                    let mut sub = content[start + marker_len..start + end].trim().to_string();
                     if !sub.ends_with(".tex") {
                         sub.push_str(".tex");
                     }
-                    let sub_path = proj_dir.join(sub);
-                    stack.push(sub_path);
+                    if let Some(sub_path) = safe_project_file(proj_dir, &sub) {
+                        stack.push(sub_path);
+                    }
                     search_pos = start + end + 1;
                 } else {
                     break;
@@ -67,6 +91,19 @@ pub async fn get_word_count(proj_dir: &FsPath, entrypoint: &str) -> u32 {
         }
     }
     total
+}
+
+fn find_latex_include(haystack: &str) -> Option<(usize, usize)> {
+    let input = haystack.find("\\input{").map(|pos| (pos, "\\input{".len()));
+    let include = haystack
+        .find("\\include{")
+        .map(|pos| (pos, "\\include{".len()));
+    match (input, include) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 /// Resolves the size of the compiled PDF and returns a human-readable display string (e.g. `"45 KB"`, `"2.4 MB"`).
@@ -169,15 +206,19 @@ fn history_entry(
 /// Automatically resets execution status tags inside the session lock upon completion or thread panic.
 pub struct BuildGuard {
     sess_arc: Arc<Mutex<Session>>,
+    generation: u64,
 }
 
 impl Drop for BuildGuard {
     fn drop(&mut self) {
         let sess_arc = self.sess_arc.clone();
+        let generation = self.generation;
         tokio::spawn(async move {
             let mut s = sess_arc.lock().await;
-            s.process = None;
-            s.current_priority = None;
+            if s.build_generation == generation {
+                s.process = None;
+                s.current_priority = None;
+            }
         });
     }
 }
@@ -356,6 +397,8 @@ pub async fn run_build(
     }
 
     cancel_session(&mut sess).await;
+    sess.build_generation = sess.build_generation.saturating_add(1);
+    let generation = sess.build_generation;
     sess.current_priority = Some(priority);
 
     let (cfg, raw_cfg) = read_cfg(&state.root, &name).await;
@@ -396,6 +439,7 @@ pub async fn run_build(
     sess.task = Some(tokio::spawn(async move {
         let _guard = BuildGuard {
             sess_arc: sess_arc_c.clone(),
+            generation,
         };
 
         debug!("Waiting for build semaphore");
@@ -500,7 +544,8 @@ pub async fn run_build(
             tx: &broadcast::Sender<String>,
             sess_arc: &Arc<Mutex<Session>>,
             timeout_duration: Duration,
-        ) -> bool {
+            generation: u64,
+        ) -> CommandOutcome {
             process::prepare_command(cmd);
 
             match cmd.spawn() {
@@ -510,7 +555,7 @@ pub async fn run_build(
                         "err",
                         format!("Failed to spawn process: {}", e),
                     ));
-                    false
+                    CommandOutcome::Failed
                 }
                 Ok(mut child) => {
                     let tracked_process = match process::track_child(&child) {
@@ -522,24 +567,33 @@ pub async fn run_build(
                                 format!("Failed to track process tree: {}", e),
                             ));
                             let _ = child.kill().await;
-                            return false;
+                            return CommandOutcome::Failed;
                         }
                     };
                     let pid = tracked_process.as_ref().map(|process| process.pid());
                     debug!("Build process started with PID: {:?}", pid);
                     {
                         let mut sess = sess_arc.lock().await;
+                        if sess.build_generation != generation {
+                            drop(sess);
+                            if let Some(process) = tracked_process {
+                                process.terminate().await;
+                            } else {
+                                let _ = child.kill().await;
+                            }
+                            return CommandOutcome::Failed;
+                        }
                         sess.process = tracked_process;
                         sess.last_accessed = Instant::now();
                     }
 
                     let Some(stdout) = child.stdout.take() else {
                         warn!("Build process stdout unavailable");
-                        return false;
+                        return CommandOutcome::Failed;
                     };
                     let Some(stderr) = child.stderr.take() else {
                         warn!("Build process stderr unavailable");
-                        return false;
+                        return CommandOutcome::Failed;
                     };
                     let tx_c = tx.clone();
                     let h1 = tokio::spawn(async move {
@@ -556,29 +610,11 @@ pub async fn run_build(
                         }
                     });
 
-                    let status = tokio::time::timeout(timeout_duration, child.wait()).await;
-                    let _ = h1.await;
-                    let _ = h2.await;
-                    {
-                        let mut sess = sess_arc.lock().await;
-                        sess.process = None;
-                        sess.last_accessed = Instant::now();
-                    }
-                    match status {
-                        Ok(Ok(s)) => {
-                            if s.success() {
-                                debug!("Build process completed successfully");
-                            } else {
-                                warn!("Build process exited with status: {}", s);
-                            }
-                            s.success()
-                        }
-                        Ok(Err(e)) => {
-                            warn!("Build process wait error: {}", e);
-                            let _ = tx.send(events::log("err", format!("Wait error: {}", e)));
-                            false
-                        }
+                    let mut timed_out = false;
+                    let status = match tokio::time::timeout(timeout_duration, child.wait()).await {
+                        Ok(status) => status,
                         Err(_) => {
+                            timed_out = true;
                             warn!("Build timeout reached - killing process");
                             let _ = tx.send(events::log(
                                 "err",
@@ -589,12 +625,50 @@ pub async fn run_build(
                             ));
                             let process = {
                                 let mut sess = sess_arc.lock().await;
-                                sess.process.take()
+                                if sess.build_generation == generation {
+                                    sess.process.take()
+                                } else {
+                                    None
+                                }
                             };
                             if let Some(process) = process {
                                 process.terminate().await;
+                            } else {
+                                let _ = child.kill().await;
                             }
-                            false
+                            child.wait().await
+                        }
+                    };
+
+                    let _ = h1.await;
+                    let _ = h2.await;
+                    {
+                        let mut sess = sess_arc.lock().await;
+                        if sess.build_generation == generation {
+                            sess.process = None;
+                            sess.last_accessed = Instant::now();
+                        }
+                    }
+                    if timed_out {
+                        return CommandOutcome::TimedOut;
+                    }
+                    match status {
+                        Ok(s) => {
+                            if s.success() {
+                                debug!("Build process completed successfully");
+                            } else {
+                                warn!("Build process exited with status: {}", s);
+                            }
+                            if s.success() {
+                                CommandOutcome::Success
+                            } else {
+                                CommandOutcome::Failed
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Build process wait error: {}", e);
+                            let _ = tx.send(events::log("err", format!("Wait error: {}", e)));
+                            CommandOutcome::Failed
                         }
                     }
                 }
@@ -605,7 +679,7 @@ pub async fn run_build(
         debug!("Compilation engine starting");
 
         #[cfg(not(feature = "latexmk"))]
-        let build_success = {
+        let build_outcome = {
             info!("Using Tectonic engine");
             let _ = tx.send(events::log("dim", "Tectonic engine active..."));
             let mut cmd = Command::new("tectonic");
@@ -618,11 +692,11 @@ pub async fn run_build(
                 &run_dir.to_string_lossy(),
             ])
             .current_dir(&proj_dir);
-            run_cmd(&mut cmd, &tx, &sess_arc_c, timeout_duration).await
+            run_cmd(&mut cmd, &tx, &sess_arc_c, timeout_duration, generation).await
         };
 
         #[cfg(feature = "latexmk")]
-        let build_success = {
+        let build_outcome = {
             info!("Using Latexmk fallback");
             let _ = tx.send(events::log(
                 "warn",
@@ -647,7 +721,7 @@ pub async fn run_build(
 
             let texinputs = format!("{}:{}/build:", proj_dir.display(), proj_dir.display());
             cmd.env("TEXINPUTS", texinputs);
-            run_cmd(&mut cmd, &tx, &sess_arc_c, timeout_duration).await
+            run_cmd(&mut cmd, &tx, &sess_arc_c, timeout_duration, generation).await
         };
 
         let log_file = run_dir.join(format!("{}.log", stem));
@@ -658,30 +732,38 @@ pub async fn run_build(
                 .args(["-w", log_file.to_str().unwrap_or_default()])
                 .current_dir(&proj_dir);
             let _ = tx.send(events::log("dim", "Analyzing warnings..."));
-            let _ = run_cmd(&mut analyzer, &tx, &sess_arc_c, timeout_duration).await;
+            let _ = run_cmd(
+                &mut analyzer,
+                &tx,
+                &sess_arc_c,
+                timeout_duration,
+                generation,
+            )
+            .await;
         } else if log_file.exists() {
             debug!("Skipping texloganalyser because it is not installed");
         }
 
-        if !build_success {
-            warn!("Build failed for {}", name);
-            let _ = tx.send(events::log("err", "Build failed. Check logs for details."));
-            let _ = tx.send(events::status("Error"));
+        if build_outcome != CommandOutcome::Success {
+            let status = build_outcome.build_status();
+            warn!("Build ended with status {} for {}", status.as_str(), name);
+            let message = if status == BuildStatus::TimedOut {
+                "Build timed out. Check logs for details."
+            } else {
+                "Build failed. Check logs for details."
+            };
+            let _ = tx.send(events::log("err", message));
+            let _ = tx.send(events::status(status.as_str()));
             let (failed_run_id, _) = finalize_run_dir(
                 &run_dir,
                 &runs_base_dir,
                 &run_timestamp,
-                BuildStatus::Failed.run_suffix().unwrap_or('F'),
+                status.run_suffix().unwrap_or('F'),
             )
             .await;
             if let Err(e) = record_build_history(
                 &state,
-                history_entry(
-                    &name,
-                    label,
-                    start_time.elapsed().as_secs_f32(),
-                    BuildStatus::Failed,
-                ),
+                history_entry(&name, label, start_time.elapsed().as_secs_f32(), status),
             )
             .await
             {
@@ -718,19 +800,34 @@ pub async fn run_build(
                 "-dBATCH",
                 &format!("-sOutputFile={}", compressed_path.display()),
                 &pdf_path.display().to_string(),
-            ]);
-            if let Ok(mut child) = gs.spawn() {
-                if let Ok(st) = child.wait().await {
-                    if st.success() {
-                        if tokio::fs::rename(&compressed_path, &pdf_path).await.is_ok() {
-                            info!("PDF compressed successfully");
-                            let _ = tx.send(events::log("ok", "PDF compressed successfully."));
-                        } else {
-                            warn!("Failed to replace original PDF with compressed PDF");
-                        }
+            ])
+            .current_dir(&run_dir);
+            match run_cmd(&mut gs, &tx, &sess_arc_c, timeout_duration, generation).await {
+                CommandOutcome::Success => {
+                    if tokio::fs::rename(&compressed_path, &pdf_path).await.is_ok() {
+                        info!("PDF compressed successfully");
+                        let _ = tx.send(events::log("ok", "PDF compressed successfully."));
                     } else {
-                        warn!("PDF compression failed");
+                        warn!("Failed to replace original PDF with compressed PDF");
+                        let _ = tx.send(events::log(
+                            "warn",
+                            "PDF compression finished, but replacing the original PDF failed.",
+                        ));
                     }
+                }
+                CommandOutcome::TimedOut => {
+                    warn!("PDF compression timed out");
+                    let _ = tx.send(events::log(
+                        "warn",
+                        "PDF compression timed out; keeping the uncompressed PDF.",
+                    ));
+                }
+                CommandOutcome::Failed => {
+                    warn!("PDF compression failed");
+                    let _ = tx.send(events::log(
+                        "warn",
+                        "PDF compression failed; keeping the uncompressed PDF.",
+                    ));
                 }
             }
         } else if state.config.compress_pdf {

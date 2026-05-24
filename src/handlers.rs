@@ -35,8 +35,8 @@ use crate::artifacts::{
 use crate::builder::run_build;
 use crate::config::{read_cfg, Config};
 use crate::dto::{
-    BuildArtifactResponse, ConfigResponse, FileListResponse, FileResponse, LintResponse,
-    PreviewResponse, ProjectStatusResponse, ProjectsResponse, SynctexEditResponse,
+    AdminMetricsResponse, BuildArtifactResponse, ConfigResponse, FileListResponse, FileResponse,
+    LintResponse, PreviewResponse, ProjectStatusResponse, ProjectsResponse, SynctexEditResponse,
     SynctexViewResponse,
 };
 use crate::errors::{ok_json, AppError};
@@ -45,7 +45,8 @@ use crate::frontend_assets::FRONTEND_DIST_HASH;
 use crate::fs_safety;
 use crate::state::{cancel_session, get_or_create_session, AppState, BuildPriority};
 use crate::utils::{
-    is_valid_entrypoint, is_valid_project_name, safe_path, safe_project_file, MAX_CONFIG_SIZE,
+    html_escape, is_valid_entrypoint, is_valid_project_name, rand_hex_string, safe_path,
+    safe_project_file, MAX_CONFIG_SIZE,
 };
 
 /// Extensions list monitored by the notify-watcher loop to trigger incremental builds.
@@ -114,14 +115,42 @@ fn response_with_body(content_type: &'static str, body: impl Into<Body>) -> Resp
 
 /// Authorizes admin-level operations by verifying the Bearer token in headers.
 fn admin_authorized(headers: &HeaderMap, state: &AppState) -> bool {
+    bearer_authorized(headers, state)
+}
+
+fn bearer_authorized(headers: &HeaderMap, state: &AppState) -> bool {
     let Some(token) = state.config.admin_token.as_deref() else {
-        return true;
+        return !state.config.require_auth;
     };
     headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .is_some_and(|v| v == token)
+}
+
+fn auth_required(state: &AppState) -> bool {
+    state.config.require_auth || state.config.admin_token.is_some()
+}
+
+fn protected_authorized(headers: &HeaderMap, state: &AppState) -> bool {
+    !auth_required(state) || bearer_authorized(headers, state)
+}
+
+/// Verifies that mutative browser-originated requests came from the EasyTex UI client.
+fn has_csrf_header(headers: &HeaderMap) -> bool {
+    headers
+        .get("X-EasyTex-Request")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|v| v == "true")
+}
+
+fn csrf_error() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "CSRF protection: X-EasyTex-Request header is missing or invalid",
+    )
+        .into_response()
 }
 
 /// Helper producing standard unauthorized responses.
@@ -200,10 +229,15 @@ fn serve_index(st: &AppState) -> Response {
 }
 
 pub async fn get_pdf(
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(q): Query<PdfQuery>,
     State(st): State<AppState>,
 ) -> Response {
+    if !protected_authorized(&headers, &st) {
+        return unauthorized();
+    }
+
     let Some(proj) = safe_path(&st.root, &name) else {
         warn!("PDF request denied - invalid project path: {}", name);
         return StatusCode::BAD_REQUEST.into_response();
@@ -278,7 +312,15 @@ pub async fn get_pdf(
     res
 }
 
-pub async fn sse_handler(Path(name): Path<String>, State(st): State<AppState>) -> Response {
+pub async fn sse_handler(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(st): State<AppState>,
+) -> Response {
+    if !protected_authorized(&headers, &st) {
+        return unauthorized();
+    }
+
     if safe_path(&st.root, &name).is_none() {
         warn!("SSE connection rejected - invalid project: {}", name);
         return StatusCode::BAD_REQUEST.into_response();
@@ -458,15 +500,24 @@ pub async fn admin_dashboard(headers: HeaderMap, State(state): State<AppState>) 
         count = map.len(),
         hist_count = history.len(),
         sessions = session_info.iter().map(|s| {
+            let name = s["name"].as_str().unwrap_or_default();
+            let escaped_name = html_escape(name);
             format!(
-                "<tr><td>{}</td><td>{:?}</td><td>{}s</td><td><button class='btn' onclick=\"fetch('/api/admin/kill/{}', {{method:'POST'}}).then(()=>location.reload())\">Kill</button></td></tr>",
-                s["name"], s["pid"], s["age"], s["name"]
+                "<tr><td>{}</td><td>{:?}</td><td>{}s</td><td><button class='btn' onclick=\"const h={{'X-EasyTex-Request':'true'}};const t=localStorage.getItem('easytex_admin_token');if(t)h.Authorization='Bearer '+t;fetch('/api/admin/kill/{}', {{method:'POST', headers:h}}).then(()=>location.reload())\">Kill</button></td></tr>",
+                escaped_name,
+                s["pid"],
+                s["age"],
+                escaped_name
             )
         }).collect::<Vec<_>>().join(""),
         history = history.iter().rev().map(|h| {
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}s</td><td>{}</td></tr>",
-                h.project, h.label, h.timestamp, h.duration, h.status
+                html_escape(&h.project),
+                html_escape(&h.label),
+                html_escape(&h.timestamp),
+                h.duration,
+                html_escape(&h.status)
             )
         }).collect::<Vec<_>>().join("")
     );
@@ -481,6 +532,9 @@ pub async fn admin_api_handler(
 ) -> Response {
     if !admin_authorized(&headers, &state) {
         return unauthorized();
+    }
+    if !has_csrf_header(&headers) {
+        return csrf_error();
     }
 
     if !is_valid_project_name(&name) {
@@ -510,6 +564,40 @@ pub async fn admin_api_handler(
     }
 }
 
+pub async fn admin_metrics(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !admin_authorized(&headers, &state) {
+        return unauthorized();
+    }
+
+    let projects = project_count(&state).await;
+    let sessions = {
+        let map = state.sessions.lock().await;
+        let sessions = map.values().cloned().collect::<Vec<_>>();
+        (map.len(), sessions)
+    };
+    let mut active_builds = 0usize;
+    for session in sessions.1 {
+        if let Ok(session) = session.try_lock() {
+            if session.process.is_some() {
+                active_builds += 1;
+            }
+        }
+    }
+    let history_entries = state.history.lock().await.len();
+
+    Json(AdminMetricsResponse {
+        projects,
+        active_sessions: sessions.0,
+        active_builds,
+        available_build_slots: state.build_semaphore.available_permits(),
+        max_concurrent_builds: state.config.max_concurrent_builds,
+        history_entries,
+        read_only: state.config.read_only,
+        auth_required: state.config.require_auth || state.config.admin_token.is_some(),
+    })
+    .into_response()
+}
+
 pub async fn api_handler_no_name(
     Path(cmd): Path<String>,
     state: State<AppState>,
@@ -524,20 +612,14 @@ pub async fn api_handler(
     req: Request,
 ) -> Response {
     let method = req.method().clone();
-    
+
+    if !protected_authorized(req.headers(), &st) {
+        return unauthorized();
+    }
+
     // CSRF protection for all mutative POST API requests
-    if method == Method::POST {
-        let has_csrf_header = req.headers()
-            .get("X-EasyTex-Request")
-            .and_then(|h| h.to_str().ok())
-            .is_some_and(|v| v == "true");
-        if !has_csrf_header {
-            return (
-                StatusCode::FORBIDDEN,
-                "CSRF protection: X-EasyTex-Request header is missing or invalid",
-            )
-                .into_response();
-        }
+    if method == Method::POST && !has_csrf_header(req.headers()) {
+        return csrf_error();
     }
 
     let uri = req.uri().clone();
@@ -553,6 +635,20 @@ pub async fn api_handler(
     };
 
     debug!("API command '{}' for project '{}'", cmd, name);
+
+    if cmd == "create" {
+        if st.config.read_only {
+            return read_only_error();
+        }
+        return create_project(&st, &name).await;
+    }
+
+    if tokio::fs::metadata(project_dir.join("EasyTex.toml"))
+        .await
+        .is_err()
+    {
+        return AppError::NotFound("Project not found".into()).into_response();
+    }
 
     match cmd.as_str() {
         "build" | "run" => {
@@ -582,6 +678,13 @@ pub async fn api_handler(
             if st.config.read_only {
                 return read_only_error();
             }
+            let map = st.sessions.lock().await;
+            if let Some(arc) = map.get(&name) {
+                let mut sess = arc.lock().await;
+                cancel_session(&mut sess).await;
+                let _ = sess.tx.send(events::status("Idle"));
+            }
+            drop(map);
             if let Err(e) = tokio::fs::remove_dir_all(project_dir.join("build")).await {
                 debug!("Clean skipped or failed for {}: {}", name, e);
             }
@@ -591,6 +694,10 @@ pub async fn api_handler(
             if st.config.read_only {
                 return read_only_error();
             }
+            if let Some(sess_arc) = st.sessions.lock().await.remove(&name) {
+                let mut sess = sess_arc.lock().await;
+                cancel_session(&mut sess).await;
+            }
             if let Err(e) = tokio::fs::remove_file(project_dir.join("EasyTex.toml")).await {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -598,14 +705,7 @@ pub async fn api_handler(
                 )
                     .into_response();
             }
-            st.sessions.lock().await.remove(&name);
             return StatusCode::OK.into_response();
-        }
-        "create" => {
-            if st.config.read_only {
-                return read_only_error();
-            }
-            return create_project(&st, &name).await;
         }
         "config" if method == Method::GET => {
             let (_, raw) = read_cfg(&st.root, &name).await;
@@ -637,19 +737,32 @@ pub async fn api_handler(
 }
 
 async fn list_projects(st: &AppState) -> Response {
+    let items = project_names(st).await;
+    info!("Listed {} projects", items.len());
+    Json(ProjectsResponse { projects: items }).into_response()
+}
+
+async fn project_count(st: &AppState) -> usize {
+    project_names(st).await.len()
+}
+
+async fn project_names(st: &AppState) -> Vec<String> {
     let mut items = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&st.root).await {
         while let Ok(Some(e)) = rd.next_entry().await {
             if e.path().is_dir() && e.path().join("EasyTex.toml").exists() {
-                if let Some(n) = e.file_name().to_str() {
+                if let Some(n) = e
+                    .file_name()
+                    .to_str()
+                    .filter(|name| is_valid_project_name(name))
+                {
                     items.push(n.to_string());
                 }
             }
         }
     }
     items.sort();
-    info!("Listed {} projects", items.len());
-    Json(ProjectsResponse { projects: items }).into_response()
+    items
 }
 
 async fn capabilities(st: &AppState) -> Response {
@@ -725,7 +838,10 @@ async fn create_project(st: &AppState, name: &str) -> Response {
     if p.exists() {
         return AppError::Conflict("Project already exists".into()).into_response();
     }
-    if let Err(e) = tokio::fs::create_dir_all(&p).await {
+    let tmp = st
+        .root
+        .join(format!(".easytex-create-{}-{}", name, rand_hex_string(12)));
+    if let Err(e) = tokio::fs::create_dir(&tmp).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to create project: {}", e),
@@ -740,13 +856,28 @@ async fn create_project(st: &AppState, name: &str) -> Response {
         ),
     ];
     for (file, content) in files {
-        if let Err(e) = tokio::fs::write(p.join(file), content).await {
+        if let Err(e) = fs_safety::write_text_limited(
+            &tmp.join(file),
+            content,
+            st.config.max_edit_file_size_bytes,
+        )
+        .await
+        {
+            let _ = tokio::fs::remove_dir_all(&tmp).await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to write {}: {}", file, e),
+                format!("Failed to write {}: {:?}", file, e),
             )
                 .into_response();
         }
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &p).await {
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to finalize project: {}", e),
+        )
+            .into_response();
     }
     ok_json()
 }
@@ -767,7 +898,8 @@ async fn save_config(project_dir: &FsPath, req: Request) -> Response {
     match toml::from_str::<Config>(&input.raw) {
         Ok(cfg) => {
             if !is_valid_entrypoint(&cfg.entrypoint) {
-                return AppError::BadRequest("Invalid entrypoint: must be a .tex file".into()).into_response();
+                return AppError::BadRequest("Invalid entrypoint: must be a .tex file".into())
+                    .into_response();
             }
             if let Some(cmd) = &cfg.format_command {
                 let parts: Vec<&str> = cmd.split_whitespace().collect();
@@ -779,13 +911,10 @@ async fn save_config(project_dir: &FsPath, req: Request) -> Response {
                     .into_response();
                 }
             }
-            match tokio::fs::write(project_dir.join("EasyTex.toml"), &input.raw).await {
+            let config_path = project_dir.join("EasyTex.toml");
+            match fs_safety::write_text_limited(&config_path, &input.raw, MAX_CONFIG_SIZE).await {
                 Ok(()) => ok_json(),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to save config: {}", e),
-                )
-                    .into_response(),
+                Err(e) => e.into_response(),
             }
         }
         Err(_) => AppError::BadRequest("Invalid TOML syntax".into()).into_response(),

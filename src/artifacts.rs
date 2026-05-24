@@ -67,7 +67,7 @@ pub async fn success_previews(project_dir: &FsPath, entrypoint: &str) -> Vec<Pre
     let mut entries = match tokio::fs::read_dir(&runs_dir).await {
         Ok(entries) => entries,
         Err(_) => {
-            return legacy_preview(&build_dir, &stem)
+            return legacy_preview(project_dir, &build_dir, &stem)
                 .await
                 .into_iter()
                 .collect()
@@ -86,14 +86,14 @@ pub async fn success_previews(project_dir: &FsPath, entrypoint: &str) -> Vec<Pre
         if !valid_success_run(&run) {
             continue;
         }
-        if let Some(preview) = preview_from_run(&stem, run, entry.path()).await {
+        if let Some(preview) = preview_from_run(project_dir, &stem, run, entry.path()).await {
             runs.push(preview);
         }
     }
 
     runs.sort_by(|a, b| b.run.cmp(&a.run));
     if runs.is_empty() {
-        legacy_preview(&build_dir, &stem)
+        legacy_preview(project_dir, &build_dir, &stem)
             .await
             .into_iter()
             .collect()
@@ -113,7 +113,7 @@ pub async fn success_preview_by_run(
     }
     let stem = entrypoint.replace(".tex", "");
     let run_dir = project_dir.join("build").join("runs").join(run);
-    preview_from_run(&stem, run.to_string(), run_dir).await
+    preview_from_run(project_dir, &stem, run.to_string(), run_dir).await
 }
 
 /// Validates whether a run identifier matches the required alphanumeric success formatting.
@@ -129,13 +129,23 @@ pub fn valid_success_run(run: &str) -> bool {
 }
 
 /// Builds a `PreviewInfo` from a validated run directory on the filesystem.
-async fn preview_from_run(stem: &str, run: String, run_dir: PathBuf) -> Option<PreviewInfo> {
+async fn preview_from_run(
+    project_dir: &FsPath,
+    stem: &str,
+    run: String,
+    run_dir: PathBuf,
+) -> Option<PreviewInfo> {
     let pdf_path = run_dir.join(format!("{}.pdf", stem));
-    if tokio::fs::metadata(&pdf_path).await.is_err() {
-        return None;
-    }
+    let pdf_path = safe_artifact_path(project_dir, &pdf_path).await?;
 
     let synctex_path = run_dir.join(format!("{}.synctex.gz", stem));
+    let synctex_path = if tokio::fs::metadata(&synctex_path).await.is_ok() {
+        safe_artifact_path(project_dir, &synctex_path)
+            .await
+            .unwrap_or_else(|| run_dir.join("__missing.synctex.gz"))
+    } else {
+        synctex_path
+    };
     let built_at_ms = run_built_at_ms(&run)
         .or_else(|| modified_at_ms(&pdf_path))
         .unwrap_or(0);
@@ -148,18 +158,38 @@ async fn preview_from_run(stem: &str, run: String, run_dir: PathBuf) -> Option<P
 }
 
 /// Fallback preview search checking if compilation has occurred in the flat `build/` directory.
-async fn legacy_preview(build_dir: &FsPath, stem: &str) -> Option<PreviewInfo> {
+async fn legacy_preview(
+    project_dir: &FsPath,
+    build_dir: &FsPath,
+    stem: &str,
+) -> Option<PreviewInfo> {
     let pdf_path = build_dir.join(format!("{}.pdf", stem));
-    if tokio::fs::metadata(&pdf_path).await.is_err() {
-        return None;
-    }
+    let pdf_path = safe_artifact_path(project_dir, &pdf_path).await?;
     let synctex_path = build_dir.join(format!("{}.synctex.gz", stem));
+    let synctex_path = if tokio::fs::metadata(&synctex_path).await.is_ok() {
+        safe_artifact_path(project_dir, &synctex_path)
+            .await
+            .unwrap_or_else(|| build_dir.join("__missing.synctex.gz"))
+    } else {
+        synctex_path
+    };
     Some(PreviewInfo {
         run: "legacy".into(),
         built_at_ms: modified_at_ms(&pdf_path).unwrap_or(0),
         pdf_path,
         synctex_path,
     })
+}
+
+async fn safe_artifact_path(project_dir: &FsPath, path: &FsPath) -> Option<PathBuf> {
+    let metadata = tokio::fs::symlink_metadata(path).await.ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let project_root = tokio::fs::canonicalize(project_dir).await.ok()?;
+    let canonical = tokio::fs::canonicalize(path).await.ok()?;
+    let build_root = project_root.join("build");
+    canonical.starts_with(&build_root).then_some(canonical)
 }
 
 /// Parses the microsecond UTC timestamp embedded in standard run ID strings to get millisecond epoch times.

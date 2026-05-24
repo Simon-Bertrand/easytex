@@ -1,4 +1,4 @@
-.PHONY: install types frontend front-build build dev-binary dev make-dev check test test-e2e test-granular doc doc-open docs clean
+.PHONY: install types frontend front-build build docker-build-binary docker-build-runtime dev-binary dev make-dev check test tests test-e2e test-granular doc doc-open docs clean
 
 CARGO ?= $(HOME)/.cargo/bin/cargo
 BUN ?= bun
@@ -20,6 +20,12 @@ front-build: frontend
 build: frontend
 	$(CARGO) build --release
 
+docker-build-binary:
+	docker build -f Dockerfile.build --target artifact -t easytex-builder .
+
+docker-build-runtime: build
+	docker build -f Dockerfile -t easytex-runtime .
+
 dev-binary: frontend
 	$(CARGO) run -- serve example
 
@@ -39,8 +45,10 @@ check: frontend
 test:
 	$(CARGO) test
 
+tests: check test-e2e
+
 test-e2e:
-	$(BUN) test
+	$(BUN) run test
 
 test-granular:
 	$(BUNX) playwright test tests/granular.spec.ts

@@ -119,3 +119,25 @@ pub struct LintResponse {
     /// Standard error buffer capturing process flags or configuration warnings.
     pub stderr: String,
 }
+
+/// Operational counters exposed to authenticated administrators.
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../frontend/src/bindings/")]
+pub struct AdminMetricsResponse {
+    /// Total number of recognized project directories under the configured root.
+    pub projects: usize,
+    /// Number of in-memory project sessions currently retained.
+    pub active_sessions: usize,
+    /// Number of sessions with a tracked compiler process.
+    pub active_builds: usize,
+    /// Available concurrent build permits at the time of sampling.
+    pub available_build_slots: usize,
+    /// Configured concurrent build capacity.
+    pub max_concurrent_builds: usize,
+    /// Number of persisted build history entries currently loaded.
+    pub history_entries: usize,
+    /// Whether mutating routes are disabled.
+    pub read_only: bool,
+    /// Whether bearer auth is mandatory for admin/mutating routes.
+    pub auth_required: bool,
+}

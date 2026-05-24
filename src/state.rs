@@ -132,6 +132,8 @@ pub struct Session {
     pub last_accessed: Instant,
     /// Current priority of the running compilation task.
     pub current_priority: Option<BuildPriority>,
+    /// Monotonic token used to avoid stale build tasks clearing newer session state.
+    pub build_generation: u64,
 }
 
 /// Securely terminates any active subprocesses and handles abort routines on the active session thread.
@@ -167,6 +169,7 @@ pub async fn get_or_create_session(state: &AppState, name: &str) -> Arc<Mutex<Se
                 _watcher: None,
                 last_accessed: now,
                 current_priority: None,
+                build_generation: 0,
             }))
         })
         .clone();

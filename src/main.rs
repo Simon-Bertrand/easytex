@@ -25,7 +25,7 @@ mod utils;
 use anyhow::{Context, Result};
 use axum::{
     body::Body,
-    http::{header, HeaderValue, Method, Request},
+    http::{header, HeaderMap, HeaderValue, Method, Request},
     middleware::{self, Next},
     response::Response,
     routing::{any, get},
@@ -49,14 +49,45 @@ use crate::capabilities::{RuntimeCapabilities, OPTIONAL_TOOLS};
 use crate::config::GlobalConfig;
 use crate::frontend_assets::FrontendAssets;
 use crate::handlers::{
-    admin_api_handler, admin_dashboard, api_handler, api_handler_no_name, get_pdf, sse_handler,
-    static_handler,
+    admin_api_handler, admin_dashboard, admin_metrics, api_handler, api_handler_no_name, get_pdf,
+    sse_handler, static_handler,
 };
 use crate::state::{cleanup_expired_sessions, load_build_history, AppState};
 use crate::utils::{command_exists, is_valid_project_name};
 
 /// Globally shared thread-safe counter tracking total HTTP requests received for diagnostics correlation.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn redacted_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let name_str = name.as_str();
+            let lower = name_str.to_ascii_lowercase();
+            let is_sensitive = matches!(
+                lower.as_str(),
+                "authorization"
+                    | "cookie"
+                    | "set-cookie"
+                    | "proxy-authorization"
+                    | "x-api-key"
+                    | "x-auth-token"
+                    | "x-easytex-admin-token"
+            ) || lower.contains("token")
+                || lower.contains("secret")
+                || lower.contains("password");
+            let value = if is_sensitive {
+                "[REDACTED]".to_string()
+            } else {
+                value
+                    .to_str()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|_| "[NON_UTF8]".to_string())
+            };
+            (name_str.to_string(), value)
+        })
+        .collect()
+}
 
 /// HTTP middleware capturing request telemetry, duration, status codes, and user agents.
 ///
@@ -84,7 +115,7 @@ async fn logging_middleware(req: Request<Body>, next: Next) -> Response {
         method = %method,
         uri = %uri,
         user_agent = %user_agent,
-        headers = ?req.headers(),
+        headers = ?redacted_headers(req.headers()),
         "HTTP request details"
     );
 
@@ -137,7 +168,7 @@ async fn logging_middleware(req: Request<Body>, next: Next) -> Response {
             uri = %uri,
             status = %status,
             duration_ms = duration.as_millis(),
-            response_headers = ?response.headers(),
+            response_headers = ?redacted_headers(response.headers()),
             "HTTP response details"
         );
     }
@@ -201,6 +232,12 @@ enum Commands {
         /// Unique safe project name.
         name: String,
     },
+    /// Print EasyTex version information.
+    Version {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -251,6 +288,22 @@ async fn main() -> Result<()> {
             )?;
             println!("Project '{}' initialized successfully.", name);
         }
+        Some(Commands::Version { json }) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "name": env!("CARGO_PKG_NAME"),
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "features": {
+                            "latexmk": cfg!(feature = "latexmk")
+                        }
+                    })
+                );
+            } else {
+                println!("easytex {}", env!("CARGO_PKG_VERSION"));
+            }
+        }
         None => {
             run_server(".".into(), None, None, "easytex.yaml".into()).await?;
         }
@@ -300,7 +353,11 @@ fn check_runtime_dependencies(compress_pdf: bool) -> Result<()> {
 fn cors_layer(cfg: &GlobalConfig) -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::HeaderName::from_static("x-easytex-request"),
+        ]);
 
     if cfg
         .cors_allowed_origins
@@ -512,6 +569,7 @@ async fn run_server(
 
     let port = port_opt.unwrap_or(g_cfg.port);
     let host = host_opt.unwrap_or_else(|| g_cfg.host.clone());
+    g_cfg.validate_effective_bind_host(&host)?;
     let addr = format!("{}:{}", host, port);
     eprintln!("Server is running at http://{}:{}", host, port);
 
@@ -529,6 +587,7 @@ async fn run_server(
         .route("/health", get(|| async { "OK" }))
         .route("/ready", get(|| async { "OK" }))
         .route("/admin", get(admin_dashboard))
+        .route("/api/admin/metrics", get(admin_metrics))
         .route("/api/:cmd", any(api_handler_no_name))
         .route("/api/:cmd/:name", any(api_handler))
         .route("/api/admin/:cmd/:name", any(admin_api_handler))
@@ -626,6 +685,8 @@ async fn shutdown_signal(state: AppState) {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::{header, HeaderMap, HeaderValue};
+
     use crate::config::Config;
     use crate::config::GlobalConfig;
     use crate::utils::{is_valid_entrypoint, is_valid_project_name, safe_path, safe_project_file};
@@ -739,6 +800,7 @@ mod tests {
         assert!(safe_project_file(&root, "../main.tex").is_none());
         assert!(safe_project_file(&root, "/tmp/main.tex").is_none());
         assert!(safe_project_file(&root, ".env").is_none());
+        assert!(safe_project_file(&root, "build/generated.tex").is_none());
         assert!(safe_project_file(&root, "build/output.sh").is_none());
         assert!(safe_project_file(&root, r"chapters\intro.tex").is_none());
         assert!(safe_project_file(&root, "C:/tmp/main.tex").is_none());
@@ -765,6 +827,54 @@ mod tests {
         assert_eq!(cfg.max_read_file_size_bytes, 2_000_000);
         assert_eq!(cfg.max_project_files, 5_000);
         assert_eq!(cfg.max_pdf_size_bytes, 100 * 1024 * 1024);
+        assert!(!cfg.require_auth);
         assert!(!cfg.read_only);
+    }
+
+    #[test]
+    fn test_auth_config_validation() {
+        let mut cfg = GlobalConfig {
+            require_auth: true,
+            ..GlobalConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+
+        cfg.admin_token = Some("test-token".into());
+        assert!(cfg.validate().is_ok());
+
+        let wildcard = GlobalConfig {
+            cors_allowed_origins: vec!["*".into()],
+            ..GlobalConfig::default()
+        };
+        assert!(wildcard.validate().is_err());
+
+        let cfg = GlobalConfig::default();
+        assert!(cfg.validate_effective_bind_host("0.0.0.0").is_err());
+
+        let cfg = GlobalConfig {
+            admin_token: Some("test-token".into()),
+            ..GlobalConfig::default()
+        };
+        assert!(cfg.validate_effective_bind_host("0.0.0.0").is_ok());
+    }
+
+    #[test]
+    fn test_redacted_headers_hide_sensitive_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        headers.insert(header::COOKIE, HeaderValue::from_static("session=secret"));
+        headers.insert("x-api-key", HeaderValue::from_static("secret-key"));
+        headers.insert("x-custom-token", HeaderValue::from_static("custom-secret"));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("EasyTexTest"));
+
+        let redacted = super::redacted_headers(&headers);
+        assert!(redacted.contains(&("authorization".into(), "[REDACTED]".into())));
+        assert!(redacted.contains(&("cookie".into(), "[REDACTED]".into())));
+        assert!(redacted.contains(&("x-api-key".into(), "[REDACTED]".into())));
+        assert!(redacted.contains(&("x-custom-token".into(), "[REDACTED]".into())));
+        assert!(redacted.contains(&("user-agent".into(), "EasyTexTest".into())));
     }
 }

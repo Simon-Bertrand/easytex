@@ -16,8 +16,9 @@ services:
       - EASYTEX_HOST=0.0.0.0
       - ROOT_DIR=/app/projects
       - RUST_LOG=info
-      # Set this in production to protect /admin and /api/admin/*.
-      # - EASYTEX_ADMIN_TOKEN=change-me
+      # Required because the container binds to 0.0.0.0.
+      # It protects /api/*, /pdf/*, /events/*, and /admin.
+      - EASYTEX_ADMIN_TOKEN=${EASYTEX_ADMIN_TOKEN:?Set EASYTEX_ADMIN_TOKEN before running docker compose}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8081/ready"]
       interval: 30s

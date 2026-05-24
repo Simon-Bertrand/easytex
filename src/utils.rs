@@ -79,7 +79,7 @@ pub fn is_editable_project_file(path: &str) -> bool {
         || path.starts_with("//")
         || path
             .split('/')
-            .any(|p| p.is_empty() || p == "." || p == ".." || p.starts_with('.'))
+            .any(|p| p.is_empty() || p == "." || p == ".." || p == "build" || p.starts_with('.'))
     {
         return false;
     }
@@ -102,8 +102,12 @@ pub fn safe_project_file(project_dir: &FsPath, relative_path: &str) -> Option<Pa
 
     let root = project_dir.canonicalize().ok()?;
     let candidate = root.join(relative_path);
-    let parent = candidate.parent()?.canonicalize().ok()?;
-    if parent.starts_with(&root) {
+    let mut ancestor = candidate.parent()?;
+    while !ancestor.exists() {
+        ancestor = ancestor.parent()?;
+    }
+    let ancestor = ancestor.canonicalize().ok()?;
+    if ancestor.starts_with(&root) {
         Some(candidate)
     } else {
         tracing::warn!("Rejected path outside project: {}", relative_path);
@@ -192,4 +196,33 @@ pub fn command_exists(command: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Escapes text for safe insertion into server-rendered HTML.
+pub fn html_escape(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::html_escape;
+
+    #[test]
+    fn html_escape_escapes_special_characters() {
+        assert_eq!(
+            html_escape(r#"<script a="b">&'</script>"#),
+            "&lt;script a=&quot;b&quot;&gt;&amp;&#39;&lt;/script&gt;"
+        );
+    }
 }

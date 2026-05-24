@@ -63,7 +63,7 @@ impl ProcessTree {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = child;
-            Ok(Self::Single { pid })
+            Ok(Self::Single { pid: _pid })
         }
     }
 

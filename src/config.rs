@@ -10,6 +10,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path as FsPath;
 
+use crate::{
+    fs_safety,
+    utils::{is_valid_entrypoint, MAX_CONFIG_SIZE},
+};
+
 /// System-wide global configuration settings.
 ///
 /// Can be loaded from `easytex.yaml` and refined using environment variables. Enforces resource
@@ -31,6 +36,8 @@ pub struct GlobalConfig {
     pub compress_pdf: bool,
     /// Optional bearer token required to access administrative dashboards.
     pub admin_token: Option<String>,
+    /// Forces mutating API requests and admin routes to require a bearer token even on localhost.
+    pub require_auth: bool,
     /// Allows the TeX engine to execute arbitrary shell commands via `-shell-escape`. Defaults to `false`.
     pub allow_shell_escape: bool,
     /// White-listed origins for CORS verification. Supports `"*"` for permissive open-sharing.
@@ -62,6 +69,7 @@ impl Default for GlobalConfig {
             build_timeout_mins: 15,
             compress_pdf: true,
             admin_token: None,
+            require_auth: false,
             allow_shell_escape: false,
             cors_allowed_origins: Vec::new(),
             host: "127.0.0.1".into(),
@@ -91,6 +99,9 @@ impl GlobalConfig {
         }
         if let Ok(token) = std::env::var("EASYTEX_ADMIN_TOKEN") {
             self.admin_token = (!token.is_empty()).then_some(token);
+        }
+        if let Ok(require_auth) = std::env::var("EASYTEX_REQUIRE_AUTH") {
+            self.require_auth = env_truthy(&require_auth);
         }
         if let Ok(origins) = std::env::var("EASYTEX_CORS_ALLOWED_ORIGINS") {
             self.cors_allowed_origins = origins
@@ -125,7 +136,7 @@ impl GlobalConfig {
             self.max_pdf_size_bytes = limit;
         }
         if let Ok(read_only) = std::env::var("EASYTEX_READ_ONLY") {
-            self.read_only = matches!(read_only.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+            self.read_only = env_truthy(&read_only);
         }
         self
     }
@@ -173,11 +184,54 @@ impl GlobalConfig {
             "cors_allowed_origins contains an invalid origin"
         );
         anyhow::ensure!(
+            !self.require_auth
+                || self
+                    .admin_token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty()),
+            "admin_token is required when require_auth is enabled"
+        );
+        anyhow::ensure!(
+            !self
+                .cors_allowed_origins
+                .iter()
+                .any(|origin| origin.trim() == "*")
+                || self
+                    .admin_token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty()),
+            "admin_token is required when cors_allowed_origins contains '*'"
+        );
+        anyhow::ensure!(
             !self.history_file.trim().is_empty(),
             "history_file must not be empty"
         );
+        self.validate_effective_bind_host(&self.host)?;
         Ok(())
     }
+
+    pub fn validate_effective_bind_host(&self, host: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            is_loopback_host(host)
+                || self
+                    .admin_token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty()),
+            "admin_token is required when binding EasyTex outside localhost"
+        );
+        Ok(())
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host.trim(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+fn env_truthy(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+    )
 }
 
 /// Project-specific settings structure parsed from local `EasyTex.toml` files.
@@ -205,11 +259,12 @@ impl Default for Config {
 /// If missing or structurally corrupt, falls back to `Config::default()`.
 pub async fn read_cfg(root: &FsPath, name: &str) -> (Config, String) {
     let p = root.join(name).join("EasyTex.toml");
-    let raw = tokio::fs::read_to_string(&p)
+    let raw = fs_safety::read_text_limited(&p, MAX_CONFIG_SIZE)
         .await
         .unwrap_or_else(|_| "entrypoint = \"main.tex\"\n".into());
-    match toml::from_str(&raw) {
-        Ok(cfg) => (cfg, raw),
+    match toml::from_str::<Config>(&raw) {
+        Ok(cfg) if is_valid_entrypoint(&cfg.entrypoint) => (cfg, raw),
         Err(_) => (Config::default(), raw),
+        _ => (Config::default(), raw),
     }
 }

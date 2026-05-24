@@ -1,0 +1,19 @@
+FROM oven/bun:1.2.15-debian AS bun
+
+FROM rust:1-bookworm AS builder
+WORKDIR /workspace
+
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+COPY xtask ./xtask
+COPY frontend ./frontend
+
+RUN cd frontend && bun install --frozen-lockfile
+RUN cd frontend && bun run build
+RUN cargo build --release
+
+FROM debian:bookworm-slim AS artifact
+COPY --from=builder /workspace/target/release/easytex /out/easytex
+ENTRYPOINT ["/out/easytex"]

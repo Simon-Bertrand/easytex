@@ -13,6 +13,12 @@ artifacts/
 example/playwright-test-*/
 tests/test-*/
 tests/test-project-*/
+tests/api-*/
+tests/ui-config-*/
+tests/ui-new-*/
+tests/token-ok-*/
+tests/.easytex-history.json
+tests/.easytex-e2e-history.json
 **/build/
 
 # Python-generated files

@@ -1,0 +1,17 @@
+port: 8081
+host: "127.0.0.1"
+root_dir: "."
+max_concurrent_builds: 2
+session_ttl_hours: 8
+build_timeout_mins: 10
+compress_pdf: true
+admin_token: null
+require_auth: true
+allow_shell_escape: false
+cors_allowed_origins: []
+history_file: ".easytex-history.json"
+max_edit_file_size_bytes: 1000000
+max_read_file_size_bytes: 2000000
+max_project_files: 5000
+max_pdf_size_bytes: 104857600
+read_only: false

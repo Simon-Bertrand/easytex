@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 
 test.describe('EasyTex Granular E2E Suite', () => {
-  const connected = /Connecté au serveur|Connected to server/;
+  const connected = /Connected to server/;
 
   test.beforeEach(async ({ page }) => {
     await page.goto('/');

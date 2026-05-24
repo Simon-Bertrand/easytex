@@ -1,11 +1,14 @@
 {
   "name": "easytex-e2e",
   "version": "1.0.0",
-  "description": "Ultimate E2E tests for EasyTex",
+  "private": true,
+  "description": "End-to-end test harness for EasyTex",
+  "license": "MIT",
   "devDependencies": {
     "@playwright/test": "^1.44.0"
   },
   "scripts": {
-    "test": "playwright test"
+    "test": "playwright test",
+    "screenshot:readme": "playwright test --config playwright.screenshot.config.ts"
   }
 }

@@ -1,14 +1,14 @@
-# --- Stage 3: Runner Image ---
 FROM texlive/texlive:latest
 WORKDIR /app
 
-# Install Tectonic (using drop-sh download script)
+# Install runtime tools from the distribution package manager. Avoid piping
+# downloaded installers into a shell in the production image path.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
-    && curl --proto '=https' --tlsv1.2 -fsSL https://drop-sh.fullyjustified.net | sh \
-    && mv tectonic /usr/local/bin/ \
-    && curl -fsSL https://github.com/WGUNDERWOOD/tex-fmt/releases/latest/download/tex-fmt-x86_64-linux.tar.gz | tar -xz -C /usr/local/bin/ \
+    chktex \
+    ghostscript \
+    tectonic \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy easytex server binary (compiled locally on host)
