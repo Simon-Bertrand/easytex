@@ -1,5 +1,6 @@
 FROM rust:1-bookworm AS tectonic-builder
 ARG TECTONIC_VERSION=0.16.9
+ARG TEX_FMT_VERSION=0.5.7
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1-dev \
@@ -9,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN cargo install tectonic --version "${TECTONIC_VERSION}" --locked
+RUN cargo install tex-fmt --version "${TEX_FMT_VERSION}" --locked
 
 FROM texlive/texlive:latest
 WORKDIR /app
@@ -23,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tectonic-builder /usr/local/cargo/bin/tectonic /usr/local/bin/tectonic
+COPY --from=tectonic-builder /usr/local/cargo/bin/tex-fmt /usr/local/bin/tex-fmt
 
 # Copy easytex server binary (compiled locally on host)
 COPY target/release/easytex /usr/local/bin/easytex
@@ -40,4 +43,5 @@ ENV RUST_LOG=info
 USER easytex
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -fsS http://localhost:8081/ready || exit 1
-ENTRYPOINT ["easytex", "serve", "/app/projects"]
+ENTRYPOINT ["easytex"]
+CMD ["serve", "/app/projects"]

@@ -6,6 +6,7 @@ on:
 
 env:
   TECTONIC_VERSION: 0.16.9
+  TEX_FMT_VERSION: 0.5.7
 
 jobs:
   rust:
@@ -70,6 +71,7 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install -y pkg-config libfontconfig1-dev libgraphite2-dev libssl-dev
       - run: cargo install tectonic --version "$TECTONIC_VERSION" --locked
+      - run: cargo install tex-fmt --version "$TEX_FMT_VERSION" --locked
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: frontend
@@ -97,6 +99,7 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install -y pkg-config libfontconfig1-dev libgraphite2-dev libssl-dev
       - run: cargo install tectonic --version "$TECTONIC_VERSION" --locked
+      - run: cargo install tex-fmt --version "$TEX_FMT_VERSION" --locked
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: frontend
