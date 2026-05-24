@@ -1263,7 +1263,7 @@ function App() {
 
               <div id="l">
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--brd);padding: 16px 16px 12px 16px;flex-shrink:0;">
-                  <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--sub)">Console de Build</span>
+                  <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--sub)">Build Console</span>
                   <div style="display:flex;gap:4px">
                     <div style="width:8px;height:8px;border-radius:50%;background:#ef4444"></div>
                     <div style="width:8px;height:8px;border-radius:50%;background:#f59e0b"></div>
