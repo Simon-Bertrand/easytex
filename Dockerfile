@@ -3,6 +3,7 @@ ARG TECTONIC_VERSION=0.16.9
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1-dev \
+    libgraphite2-dev \
     libssl-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
